@@ -1176,7 +1176,7 @@ class GPT(nn.Module):
         self.x0_lambdas = nn.Parameter(torch.zeros(num_layers))
         self.x0_lambdas.label = 'x0_lambdas'
 
-        pad = (-num_layers * 3 - 2) % dist.get_world_size()  # updated: 3*num_layers instead of 4*
+        pad = -(num_layers * 4 + 2) % dist.get_world_size()  # pad to multiple of word size
         self.scalars = nn.Parameter(
             torch.cat(
                 [
