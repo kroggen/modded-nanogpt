@@ -1076,10 +1076,6 @@ class GPT(nn.Module):
         self.num_layers = num_layers
         vocab_size = next_multiple_of_n(vocab_size, n=128)
 
-        self.smear_gate = nn.Linear(12, 1, bias=False)
-        nn.init.zeros_(self.smear_gate.weight)
-        self.smear_gate.weight.label = 'smear_gate'
-
         self.skip_gate = nn.Linear(12, 1, bias=False)
         nn.init.zeros_(self.skip_gate.weight)
         self.skip_gate.weight.label = 'skip_gate'
@@ -1180,14 +1176,13 @@ class GPT(nn.Module):
         self.x0_lambdas = nn.Parameter(torch.zeros(num_layers))
         self.x0_lambdas.label = 'x0_lambdas'
 
-        pad = (-num_layers * 3 - 3) % dist.get_world_size()  # updated: 3*num_layers instead of 4*
+        pad = (-num_layers * 3 - 2) % dist.get_world_size()  # updated: 3*num_layers instead of 4*
         self.scalars = nn.Parameter(
             torch.cat(
                 [
                     1.1 * torch.ones(num_layers),  # resid lambdas. 1.1 init such that layer i weight is i^(num_layers-i).
                     *[torch.tensor([0.5, 1.0]) for _ in range(num_layers)],  # SA lambdas
                     0.1 * torch.ones(num_layers), # bigram lambdas
-                    torch.zeros(1), # smear_lambda
                     0.5*torch.ones(1), # backout_lambda
                     -1.5 * torch.ones(1),  # skip_lambda -> σ(-1.5) ≈ 0.18
                     torch.ones(pad),
@@ -1214,9 +1209,8 @@ class GPT(nn.Module):
         x0_lambdas = self.x0_lambdas
         sa_lambdas = self.scalars[1 * self.num_layers: 3 * self.num_layers].view(-1, 2)
         bigram_lambdas = self.scalars[3 * self.num_layers: 4 * self.num_layers]
-        smear_lambda = self.scalars[4 * self.num_layers]
-        backout_lambda = self.scalars[4 * self.num_layers+1]
-        skip_lambda = self.scalars[4 * self.num_layers+2]
+        backout_lambda = self.scalars[4 * self.num_layers]
+        skip_lambda = self.scalars[4 * self.num_layers+1]
 
         # set block masks and key shift
         short_bm = ws_short * args.block_size
@@ -1236,9 +1230,6 @@ class GPT(nn.Module):
         ve = [ve[1], ve[2]] + [None] * (self.num_layers - 5) + [ve[0], ve[1], ve[2]]
         assert len(ve) == self.num_layers
 
-        # smear token embed forward 1 position @classiclarryd
-        smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :self.smear_gate.weight.size(-1)]))
-        x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
         x = x0 = norm(x[None])
 
         # unbind gate banks to avoid select_backwards kernel
@@ -1580,7 +1571,6 @@ class TrainingManager():
             "ve1":            {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "ve2":            {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "bigram_embed":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
@@ -1592,7 +1582,7 @@ class TrainingManager():
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
+            "scalars", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
             "ve0", "ve1", "ve2", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "attn", "mlp",        # Large, polar express - process last to maximize overlap
