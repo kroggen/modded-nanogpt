@@ -1172,25 +1172,26 @@ class GPT(nn.Module):
         with torch.no_grad():
             self.embed.weight.copy_(self.lm_head.weight.T)
 
-        # 3 bigram embeddings (A, B, C) used in pattern: none,A,A,A,B,B,B,C,C,C,none
-        self.bigram_embeds = nn.ModuleList([nn.Embedding(args.bigram_vocab_size, model_dim) for _ in range(3)])
-        for i, be in enumerate(self.bigram_embeds):
-            be.weight.label = f'bigram_embed{i}'
-            nn.init.zeros_(be.weight)
-        # Map layer index to bigram embed index (None means no bigram for that layer)
-        self.bigram_layer_map = [None, 0, 0, 0, 1, 1, 1, 2, 2, 2, None]
+        # 1 bigram + 1 trigram embedding, with per-layer lambdas
+        self.bigram_embed = nn.Embedding(args.bigram_vocab_size, model_dim)
+        self.bigram_embed.weight.label = 'bigram_embed'
+        nn.init.zeros_(self.bigram_embed.weight)
+        self.trigram_embed = nn.Embedding(args.trigram_vocab_size, model_dim)
+        self.trigram_embed.weight.label = 'trigram_embed'
+        nn.init.zeros_(self.trigram_embed.weight)
 
         # x0_lambdas separated out for different optimizer treatment (no beta smoothing)
         self.x0_lambdas = nn.Parameter(torch.zeros(num_layers))
         self.x0_lambdas.label = 'x0_lambdas'
 
-        pad = (-num_layers * 3 - 3) % dist.get_world_size()  # updated: 3*num_layers instead of 4*
+        pad = (-num_layers * 4 - 3) % dist.get_world_size()
         self.scalars = nn.Parameter(
             torch.cat(
                 [
                     1.1 * torch.ones(num_layers),  # resid lambdas. 1.1 init such that layer i weight is i^(num_layers-i).
                     *[torch.tensor([0.5, 1.0]) for _ in range(num_layers)],  # SA lambdas
-                    0.1 * torch.ones(num_layers), # bigram lambdas
+                    0.1 * torch.ones(num_layers), # bigram lambdas (per-layer)
+                    0.1 * torch.ones(num_layers), # trigram lambdas (per-layer)
                     torch.zeros(1), # smear_lambda
                     0.5*torch.ones(1), # backout_lambda
                     -1.5 * torch.ones(1),  # skip_lambda -> σ(-1.5) ≈ 0.18
@@ -1200,7 +1201,7 @@ class GPT(nn.Module):
         )
         self.scalars.label = 'scalars'
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
+    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, trigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
 
         # unpack schedule_cfg
@@ -1217,10 +1218,11 @@ class GPT(nn.Module):
         resid_lambdas = self.scalars[: 1 * self.num_layers]
         x0_lambdas = self.x0_lambdas
         sa_lambdas = self.scalars[1 * self.num_layers: 3 * self.num_layers].view(-1, 2)
-        bigram_lambdas = self.scalars[3 * self.num_layers: 4 * self.num_layers]
-        smear_lambda = self.scalars[4 * self.num_layers]
-        backout_lambda = self.scalars[4 * self.num_layers+1]
-        skip_lambda = self.scalars[4 * self.num_layers+2]
+        bg_lambdas = self.scalars[3 * self.num_layers: 4 * self.num_layers]
+        tg_lambdas = self.scalars[4 * self.num_layers: 5 * self.num_layers]
+        smear_lambda = self.scalars[5 * self.num_layers]
+        backout_lambda = self.scalars[5 * self.num_layers+1]
+        skip_lambda = self.scalars[5 * self.num_layers+2]
 
         # set block masks and key shift
         short_bm = ws_short * args.block_size
@@ -1231,8 +1233,9 @@ class GPT(nn.Module):
 
         # Embedding lookup - embed is synced from lm_head during tied phase by optimizer
         x = self.embed(input_seq)
-        # Compute all 3 bigram embeddings
-        x0_bigrams = [be(bigram_input_seq)[None] for be in self.bigram_embeds]
+        # Compute bigram and trigram embeddings
+        x0_bigram = self.bigram_embed(bigram_input_seq)[None]
+        x0_trigram = self.trigram_embed(trigram_input_seq)[None]
         
         # Value embeddings - always computed (not precomputed)
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
@@ -1274,18 +1277,10 @@ class GPT(nn.Module):
             if i in skip_out:
                 skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
                 x = x + skip_gate_out * skip_connections.pop()
-            # Get bigram contribution for this layer (None for layers 3 and 7)
-            bigram_idx = self.bigram_layer_map[i]
             if i == 0:
-                if bigram_idx is not None:
-                    x = (resid_lambdas[0] + x0_lambdas[0]) * x + bigram_lambdas[0] * x0_bigrams[bigram_idx]
-                else:
-                    x = (resid_lambdas[0] + x0_lambdas[0]) * x
+                x = (resid_lambdas[0] + x0_lambdas[0]) * x + bg_lambdas[0] * x0_bigram + tg_lambdas[0] * x0_trigram
             else:
-                if bigram_idx is not None:
-                    x = resid_lambdas[i] * x + x0_lambdas[i] * x0 + bigram_lambdas[i] * x0_bigrams[bigram_idx]
-                else:
-                    x = resid_lambdas[i] * x + x0_lambdas[i] * x0
+                x = resid_lambdas[i] * x + x0_lambdas[i] * x0 + bg_lambdas[i] * x0_bigram + tg_lambdas[i] * x0_trigram
             
             # Get weights for this layer from banks
             qkvo_w = attn_weights[self.layer_to_attn_idx[i]] if i in self.layer_to_attn_idx else None
@@ -1431,6 +1426,21 @@ def get_bigram_hash(x):
     x[1:] = torch.bitwise_xor(rand_int_1 * x[1:], rand_int_2 * x[:-1]) % mod
     return x
 
+def get_trigram_hash(x):
+    """
+    Computes trigram hash for each position using [prev_prev_token, prev_token, curr_token].
+    Positions 0 and 1 are mapped to the reserved index (vocab_size - 1).
+    """
+    rand_int_1 = 36313
+    rand_int_2 = 27191
+    rand_int_3 = 41893
+    mod = args.trigram_vocab_size-1
+    x = x.to(torch.int32).clone()
+    x[0] = mod
+    x[1] = mod
+    x[2:] = (torch.bitwise_xor(torch.bitwise_xor(rand_int_1 * x[2:], rand_int_2 * x[1:-1]), rand_int_3 * x[:-2])) % mod
+    return x
+
 def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True):
     # align_to_bos: each sequence begins with Beginning of Sequence token, sequences truncated to max_seq_len
     rank = dist.get_rank() if dist.is_initialized() else 0
@@ -1493,12 +1503,14 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
         _targets = _targets.to(dtype=torch.int64)
         _cum_lengths = _cum_lengths.to(dtype=torch.int32)
         _bigram_inputs = get_bigram_hash(_inputs)
+        _trigram_inputs = get_trigram_hash(_inputs)
 
         new_params = yield (
             _inputs.to(device="cuda", non_blocking=True),
             _targets.to(device="cuda", non_blocking=True),
             _cum_lengths.to(device="cuda", non_blocking=True),
-            _bigram_inputs.to(device="cuda", non_blocking=True)
+            _bigram_inputs.to(device="cuda", non_blocking=True),
+            _trigram_inputs.to(device="cuda", non_blocking=True)
         )
 
         if new_params is not None:
@@ -1592,9 +1604,8 @@ class TrainingManager():
             "ve0":            {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "ve1":            {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "ve2":            {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "bigram_embed0":  {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "bigram_embed1":  {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "bigram_embed2":  {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "bigram_embed":  {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "trigram_embed": {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
@@ -1608,7 +1619,7 @@ class TrainingManager():
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
-            "ve0", "ve1", "ve2", "bigram_embed0", "bigram_embed1", "bigram_embed2",  # Medium
+            "ve0", "ve1", "ve2", "bigram_embed", "trigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "attn", "mlp",        # Large, polar express - process last to maximize overlap
         ]
@@ -1757,8 +1768,9 @@ class Hyperparameters:
     ws_schedule: tuple = (3, 7, 11)
     ws_final: int = 13 # increase final validation ws, used for YaRN extension and short window size @classiclarryd
     ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
-    # bigram hash embedding
+    # bigram/trigram hash embedding
     bigram_vocab_size = 50304 * 5
+    trigram_vocab_size = 50304 * 5
 
 args = Hyperparameters()
 
@@ -1845,13 +1857,13 @@ for step in warmup_steps:
     training_manager.advance_schedule(step)
     model.eval()
     with torch.no_grad():
-        inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
-        model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+        inputs, targets, cum_seqlens, bigram_inputs, trigram_inputs = next(val_loader)
+        model(inputs, targets, cum_seqlens, bigram_inputs, trigram_inputs, training_manager.get_forward_args())
     model.train()
     for idx in range(grad_accum_steps):
         send_args = training_manager.train_loader_send_args
-        inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(send_args)
-        (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps).backward()
+        inputs, targets, cum_seqlens, bigram_inputs, trigram_inputs = train_loader.send(send_args)
+        (model(inputs, targets, cum_seqlens, bigram_inputs, trigram_inputs, training_manager.get_forward_args()) / grad_accum_steps).backward()
     training_manager.step_optimizers(step)
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
@@ -1890,8 +1902,8 @@ for step in range(train_steps + 1):
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
-                inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+                inputs, targets, cum_seqlens, bigram_inputs, trigram_inputs = next(val_loader)
+                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, trigram_inputs, training_manager.get_forward_args())
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
@@ -1911,8 +1923,8 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     for idx in range(grad_accum_steps):
-        inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(training_manager.train_loader_send_args)
-        (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps).backward()
+        inputs, targets, cum_seqlens, bigram_inputs, trigram_inputs = train_loader.send(training_manager.train_loader_send_args)
+        (model(inputs, targets, cum_seqlens, bigram_inputs, trigram_inputs, training_manager.get_forward_args()) / grad_accum_steps).backward()
     training_manager.step_optimizers(step)
 
     # logging
