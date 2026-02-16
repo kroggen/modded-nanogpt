@@ -1173,13 +1173,13 @@ class GPT(nn.Module):
             self.embed.weight.copy_(self.lm_head.weight.T)
 
         # 3 shared ngram embeddings (A, B, C) used for both bigram and trigram lookups
-        # Pattern: none,A,A,A,B,B,B,C,C,C,none
+        # Pattern: none,A,B,C,A,B,C,A,B,C,none
         # Banked into a single parameter for efficient sharding (1 comm op instead of 6)
         # Shape: (3 * ngram_vocab_size, model_dim) for even distribution across GPUs
         self.ngram_bank = nn.Parameter(torch.zeros(3 * args.ngram_vocab_size, model_dim))
         self.ngram_bank.label = 'ngram_bank'
         # Map layer index to embed index (None means no ngram for that layer)
-        self.ngram_layer_map = [None, 0, 0, 0, 1, 1, 1, 2, 2, 2, None]
+        self.ngram_layer_map = [None, 0, 1, 2, 0, 1, 2, 0, 1, 2, None]
 
         # x0_lambdas separated out for different optimizer treatment (no beta smoothing)
         self.x0_lambdas = nn.Parameter(torch.zeros(num_layers))
