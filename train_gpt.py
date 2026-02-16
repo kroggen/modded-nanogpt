@@ -1172,14 +1172,14 @@ class GPT(nn.Module):
         with torch.no_grad():
             self.embed.weight.copy_(self.lm_head.weight.T)
 
-        # Single bigram embedding looked up with 9 hash functions, mixed in groups of 3
-        # Layer groups A, B, C each mix 3 hashes: A=[0,1,2], B=[3,4,5], C=[6,7,8]
+        # Single bigram embedding looked up with 6 hash functions, mixed in groups of 2
+        # Layer groups A, B, C each mix 2 hashes: A=[0,1], B=[2,3], C=[4,5]
         # Pattern: none,A,B,C,A,B,C,A,B,C,none
         self.bigram_embed = nn.Embedding(args.bigram_vocab_size, model_dim)
         self.bigram_embed.weight.label = 'bigram_embed'
         nn.init.zeros_(self.bigram_embed.weight)
         # Map layer index to hash group (None means no bigram for that layer)
-        # Group 0->hashes[0:3], group 1->hashes[3:6], group 2->hashes[6:9]
+        # Group 0->hashes[0:2], group 1->hashes[2:4], group 2->hashes[4:6]
         self.bigram_layer_map = [None, 0, 1, 2, 0, 1, 2, 0, 1, 2, None]
 
         # x0_lambdas separated out for different optimizer treatment (no beta smoothing)
@@ -1233,13 +1233,13 @@ class GPT(nn.Module):
 
         # Embedding lookup - embed is synced from lm_head during tied phase by optimizer
         x = self.embed(input_seq)
-        # Look up single bigram embedding with 9 hashes, mix in groups of 3
-        # Group A (hashes 0,1,2), Group B (hashes 3,4,5), Group C (hashes 6,7,8)
-        bigram_lookups = [self.bigram_embed(bigram_input_seqs[i])[None] for i in range(9)]
+        # Look up single bigram embedding with 6 hashes, mix in groups of 2
+        # Group A (hashes 0,1), Group B (hashes 2,3), Group C (hashes 4,5)
+        bigram_lookups = [self.bigram_embed(bigram_input_seqs[i])[None] for i in range(6)]
         x0_bigrams = [
-            bigram_lookups[0] + bigram_lookups[1] + bigram_lookups[2],
-            bigram_lookups[3] + bigram_lookups[4] + bigram_lookups[5],
-            bigram_lookups[6] + bigram_lookups[7] + bigram_lookups[8],
+            bigram_lookups[0] + bigram_lookups[1],
+            bigram_lookups[2] + bigram_lookups[3],
+            bigram_lookups[4] + bigram_lookups[5],
         ]
         
         # Value embeddings - always computed (not precomputed)
@@ -1424,14 +1424,14 @@ class DataPreloader:
             self.thread.join()
         return self.data
 
-def get_bigram_hashes(x, num_hashes=9):
+def get_bigram_hashes(x, num_hashes=6):
     """
     Computes multiple bigram hashes for each position using [prev_token, curr_token].
     Each hash uses different constants so collisions differ across lookups.
     Position 0 is mapped to the reserved index (vocab_size - 1).
     BOS_tokens within the batch will hash based on last token of prior doc. Masking this ran slower and showed no improvement.
     Returns a stacked tensor of shape (num_hashes, seq_len).
-    Groups of 3 hashes are mixed per layer group: A uses [0,1,2], B uses [3,4,5], C uses [6,7,8].
+    Groups of 2 hashes are mixed per layer group: A uses [0,1], B uses [2,3], C uses [4,5].
     """
     hash_constants = [
         (36313, 27191),
@@ -1440,9 +1440,6 @@ def get_bigram_hashes(x, num_hashes=9):
         (81509, 19427),
         (47653, 58031),
         (93179, 31247),
-        (28661, 67493),
-        (71347, 43891),
-        (54277, 85123),
     ]
     mod = args.bigram_vocab_size - 1
     x = x.to(torch.int32)
@@ -1516,7 +1513,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
         _inputs = _inputs.to(dtype=torch.int32)
         _targets = _targets.to(dtype=torch.int64)
         _cum_lengths = _cum_lengths.to(dtype=torch.int32)
-        _bigram_inputs = get_bigram_hashes(_inputs, num_hashes=9)
+        _bigram_inputs = get_bigram_hashes(_inputs, num_hashes=6)
 
         new_params = yield (
             _inputs.to(device="cuda", non_blocking=True),
