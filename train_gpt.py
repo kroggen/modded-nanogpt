@@ -1172,16 +1172,13 @@ class GPT(nn.Module):
         with torch.no_grad():
             self.embed.weight.copy_(self.lm_head.weight.T)
 
-        # 3 bigram + 3 trigram embeddings (A, B, C) used in pattern: none,A,A,A,B,B,B,C,C,C,none
-        self.bigram_embeds = nn.ModuleList([nn.Embedding(args.bigram_vocab_size, model_dim) for _ in range(3)])
-        for i, be in enumerate(self.bigram_embeds):
-            be.weight.label = f'bigram_embed{i}'
-            nn.init.zeros_(be.weight)
-        self.trigram_embeds = nn.ModuleList([nn.Embedding(args.trigram_vocab_size, model_dim) for _ in range(3)])
-        for i, te in enumerate(self.trigram_embeds):
-            te.weight.label = f'trigram_embed{i}'
-            nn.init.zeros_(te.weight)
-        # Map layer index to embed index (None means no bigram/trigram for that layer)
+        # 3 shared ngram embeddings (A, B, C) used for both bigram and trigram lookups
+        # Pattern: none,A,A,A,B,B,B,C,C,C,none
+        # Banked into a single parameter for efficient sharding (1 comm op instead of 6)
+        # Shape: (3 * ngram_vocab_size, model_dim) for even distribution across GPUs
+        self.ngram_bank = nn.Parameter(torch.zeros(3 * args.ngram_vocab_size, model_dim))
+        self.ngram_bank.label = 'ngram_bank'
+        # Map layer index to embed index (None means no ngram for that layer)
         self.ngram_layer_map = [None, 0, 0, 0, 1, 1, 1, 2, 2, 2, None]
 
         # x0_lambdas separated out for different optimizer treatment (no beta smoothing)
@@ -1237,9 +1234,10 @@ class GPT(nn.Module):
 
         # Embedding lookup - embed is synced from lm_head during tied phase by optimizer
         x = self.embed(input_seq)
-        # Compute all 3 bigram and 3 trigram embeddings
-        x0_bigrams = [be(bigram_input_seq)[None] for be in self.bigram_embeds]
-        x0_trigrams = [te(trigram_input_seq)[None] for te in self.trigram_embeds]
+        # Unbind ngram bank into 3 shared tables, look up both bigram and trigram from each
+        ngram_weights = self.ngram_bank.view(3, args.ngram_vocab_size, -1).unbind(0)
+        x0_bigrams = [F.embedding(bigram_input_seq, w)[None] for w in ngram_weights]
+        x0_trigrams = [F.embedding(trigram_input_seq, w)[None] for w in ngram_weights]
         
         # Value embeddings - always computed (not precomputed)
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
@@ -1431,7 +1429,7 @@ def get_bigram_hash(x):
     """
     rand_int_1 = 36313
     rand_int_2 = 27191
-    mod = args.bigram_vocab_size-1
+    mod = args.ngram_vocab_size-1
     x = x.to(torch.int32).clone()
     x[0] = mod
     x[1:] = torch.bitwise_xor(rand_int_1 * x[1:], rand_int_2 * x[:-1]) % mod
@@ -1445,7 +1443,7 @@ def get_trigram_hash(x):
     rand_int_1 = 36313
     rand_int_2 = 27191
     rand_int_3 = 41893
-    mod = args.trigram_vocab_size-1
+    mod = args.ngram_vocab_size-1
     x = x.to(torch.int32).clone()
     x[0] = mod
     x[1] = mod
@@ -1615,12 +1613,7 @@ class TrainingManager():
             "ve0":            {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "ve1":            {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "ve2":            {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "bigram_embed0":  {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "bigram_embed1":  {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "bigram_embed2":  {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "trigram_embed0": {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "trigram_embed1": {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "trigram_embed2": {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "ngram_bank":     {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
@@ -1634,7 +1627,7 @@ class TrainingManager():
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
-            "ve0", "ve1", "ve2", "bigram_embed0", "bigram_embed1", "bigram_embed2", "trigram_embed0", "trigram_embed1", "trigram_embed2",  # Medium
+            "ve0", "ve1", "ve2", "ngram_bank",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "attn", "mlp",        # Large, polar express - process last to maximize overlap
         ]
@@ -1783,9 +1776,8 @@ class Hyperparameters:
     ws_schedule: tuple = (3, 7, 11)
     ws_final: int = 13 # increase final validation ws, used for YaRN extension and short window size @classiclarryd
     ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
-    # bigram/trigram hash embedding
-    bigram_vocab_size = 50304 * 5
-    trigram_vocab_size = 50304 * 5
+    # ngram hash embedding
+    ngram_vocab_size = 50304 * 5
 
 args = Hyperparameters()
 
@@ -1848,6 +1840,7 @@ model.attn_gate_bank.data = model.attn_gate_bank.data.bfloat16()
 model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 model.attn_bank.data = model.attn_bank.data.bfloat16()
 model.mlp_bank.data = model.mlp_bank.data.bfloat16()
+model.ngram_bank.data = model.ngram_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
