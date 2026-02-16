@@ -1172,12 +1172,12 @@ class GPT(nn.Module):
         with torch.no_grad():
             self.embed.weight.copy_(self.lm_head.weight.T)
 
-        # 3 bigram embeddings (A, B, C) used in pattern: none,A,B,C,A,B,C,A,B,C,none
-        self.bigram_embeds = nn.ModuleList([nn.Embedding(args.bigram_vocab_size, model_dim) for _ in range(3)])
-        for i, be in enumerate(self.bigram_embeds):
-            be.weight.label = f'bigram_embed{i}'
-            nn.init.zeros_(be.weight)
-        # Map layer index to bigram embed index (None means no bigram for that layer)
+        # Single bigram embedding looked up with 3 different hash functions (A, B, C)
+        # Pattern: none,A,B,C,A,B,C,A,B,C,none
+        self.bigram_embed = nn.Embedding(args.bigram_vocab_size, model_dim)
+        self.bigram_embed.weight.label = 'bigram_embed'
+        nn.init.zeros_(self.bigram_embed.weight)
+        # Map layer index to hash index (None means no bigram for that layer)
         self.bigram_layer_map = [None, 0, 1, 2, 0, 1, 2, 0, 1, 2, None]
 
         # x0_lambdas separated out for different optimizer treatment (no beta smoothing)
@@ -1231,8 +1231,8 @@ class GPT(nn.Module):
 
         # Embedding lookup - embed is synced from lm_head during tied phase by optimizer
         x = self.embed(input_seq)
-        # Compute all 3 bigram embeddings, each using its own hash
-        x0_bigrams = [be(bigram_input_seqs[i])[None] for i, be in enumerate(self.bigram_embeds)]
+        # Look up single bigram embedding with 3 different hashes
+        x0_bigrams = [self.bigram_embed(bigram_input_seqs[i])[None] for i in range(3)]
         
         # Value embeddings - always computed (not precomputed)
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
@@ -1601,9 +1601,7 @@ class TrainingManager():
             "ve0":            {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "ve1":            {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "ve2":            {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "bigram_embed0":  {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "bigram_embed1":  {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "bigram_embed2":  {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "bigram_embed":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
@@ -1617,7 +1615,7 @@ class TrainingManager():
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
-            "ve0", "ve1", "ve2", "bigram_embed0", "bigram_embed1", "bigram_embed2",  # Medium
+            "ve0", "ve1", "ve2", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "attn", "mlp",        # Large, polar express - process last to maximize overlap
         ]
