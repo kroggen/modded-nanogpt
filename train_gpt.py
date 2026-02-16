@@ -1200,7 +1200,7 @@ class GPT(nn.Module):
         )
         self.scalars.label = 'scalars'
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
+    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seqs: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
 
         # unpack schedule_cfg
@@ -1231,8 +1231,8 @@ class GPT(nn.Module):
 
         # Embedding lookup - embed is synced from lm_head during tied phase by optimizer
         x = self.embed(input_seq)
-        # Compute all 3 bigram embeddings
-        x0_bigrams = [be(bigram_input_seq)[None] for be in self.bigram_embeds]
+        # Compute all 3 bigram embeddings, each using its own hash
+        x0_bigrams = [be(bigram_input_seqs[i])[None] for i, be in enumerate(self.bigram_embeds)]
         
         # Value embeddings - always computed (not precomputed)
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
@@ -1416,20 +1416,29 @@ class DataPreloader:
             self.thread.join()
         return self.data
 
-def get_bigram_hash(x):
+def get_bigram_hashes(x, num_hashes=3):
     """
-    Computes bigram hash for each position using [prev_token, curr_token].
-    Multiply by arbitary large ints to get even spread over int32 range.
+    Computes multiple bigram hashes for each position using [prev_token, curr_token].
+    Each hash uses different constants so collisions differ across embeddings.
     Position 0 is mapped to the reserved index (vocab_size - 1).
     BOS_tokens within the batch will hash based on last token of prior doc. Masking this ran slower and showed no improvement.
+    Returns a stacked tensor of shape (num_hashes, seq_len).
     """
-    rand_int_1 = 36313
-    rand_int_2 = 27191
-    mod = args.bigram_vocab_size-1
-    x = x.to(torch.int32).clone()
-    x[0] = mod
-    x[1:] = torch.bitwise_xor(rand_int_1 * x[1:], rand_int_2 * x[:-1]) % mod
-    return x
+    hash_constants = [
+        (36313, 27191),
+        (52711, 41983),
+        (65449, 73259),
+    ]
+    mod = args.bigram_vocab_size - 1
+    x = x.to(torch.int32)
+    hashes = []
+    for i in range(num_hashes):
+        r1, r2 = hash_constants[i]
+        h = x.clone()
+        h[0] = mod
+        h[1:] = torch.bitwise_xor(r1 * x[1:], r2 * x[:-1]) % mod
+        hashes.append(h)
+    return torch.stack(hashes)
 
 def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True):
     # align_to_bos: each sequence begins with Beginning of Sequence token, sequences truncated to max_seq_len
@@ -1492,7 +1501,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
         _inputs = _inputs.to(dtype=torch.int32)
         _targets = _targets.to(dtype=torch.int64)
         _cum_lengths = _cum_lengths.to(dtype=torch.int32)
-        _bigram_inputs = get_bigram_hash(_inputs)
+        _bigram_inputs = get_bigram_hashes(_inputs)
 
         new_params = yield (
             _inputs.to(device="cuda", non_blocking=True),
