@@ -1780,7 +1780,7 @@ class Hyperparameters:
     ws_final: int = 13 # increase final validation ws, used for YaRN extension and short window size @classiclarryd
     ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
     # bigram hash embedding
-    bigram_vocab_size = 50304 * 15
+    bigram_vocab_size = 50304 * 5
 
 args = Hyperparameters()
 
