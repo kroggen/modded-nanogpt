@@ -1278,7 +1278,7 @@ class GPT(nn.Module):
                 skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
                 x = x + skip_gate_out * skip_connections.pop()
             if i == 0:
-                x = (resid_lambdas[0] + x0_lambdas[0]) * x + bg_lambdas[0] * x0_bigram + tg_lambdas[0] * x0_trigram
+                x = x0_lambdas[0] * x + bg_lambdas[0] * x0_bigram + tg_lambdas[0] * x0_trigram
             else:
                 x = resid_lambdas[i] * x + x0_lambdas[i] * x0 + bg_lambdas[i] * x0_bigram + tg_lambdas[i] * x0_trigram
             
