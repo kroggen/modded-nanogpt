@@ -1172,13 +1172,13 @@ class GPT(nn.Module):
         with torch.no_grad():
             self.embed.weight.copy_(self.lm_head.weight.T)
 
-        # 3 bigram embeddings (A, B, C) used in pattern: none,A,B,C,A,B,C,A,B,C,none
-        self.bigram_embeds = nn.ModuleList([nn.Embedding(args.bigram_vocab_size, model_dim) for _ in range(3)])
+        # 2 bigram embeddings (A, B) used in pattern: none,A,B,none,A,B,none,A,B,none,none
+        self.bigram_embeds = nn.ModuleList([nn.Embedding(args.bigram_vocab_size, model_dim) for _ in range(2)])
         for i, be in enumerate(self.bigram_embeds):
             be.weight.label = f'bigram_embed{i}'
             nn.init.zeros_(be.weight)
         # Map layer index to bigram embed index (None means no bigram for that layer)
-        self.bigram_layer_map = [None, 0, 1, 2, 0, 1, 2, 0, 1, 2, None]
+        self.bigram_layer_map = [None, 0, 1, None, 0, 1, None, 0, 1, None, None]
 
         # x0_lambdas separated out for different optimizer treatment (no beta smoothing)
         self.x0_lambdas = nn.Parameter(torch.zeros(num_layers))
@@ -1416,7 +1416,7 @@ class DataPreloader:
             self.thread.join()
         return self.data
 
-def get_bigram_hashes(x, num_hashes=3):
+def get_bigram_hashes(x, num_hashes=2):
     """
     Computes multiple bigram hashes for each position using [prev_token, curr_token].
     Each hash uses different constants so collisions differ across embeddings.
@@ -1603,7 +1603,6 @@ class TrainingManager():
             "ve2":            {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "bigram_embed0":  {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "bigram_embed1":  {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "bigram_embed2":  {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
@@ -1617,7 +1616,7 @@ class TrainingManager():
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
-            "ve0", "ve1", "ve2", "bigram_embed0", "bigram_embed1", "bigram_embed2",  # Medium
+            "ve0", "ve1", "ve2", "bigram_embed0", "bigram_embed1",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "attn", "mlp",        # Large, polar express - process last to maximize overlap
         ]
