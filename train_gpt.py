@@ -1172,25 +1172,23 @@ class GPT(nn.Module):
         with torch.no_grad():
             self.embed.weight.copy_(self.lm_head.weight.T)
 
-        # 3 bigram embeddings (A, B, C) used in pattern: none,A,B,C,A,B,C,A,B,C,none
+        # 3 bigram embeddings (A, B, C) — all applied on every layer with per-layer per-bigram lambdas
         self.bigram_embeds = nn.ModuleList([nn.Embedding(args.bigram_vocab_size, model_dim) for _ in range(3)])
         for i, be in enumerate(self.bigram_embeds):
             be.weight.label = f'bigram_embed{i}'
             nn.init.zeros_(be.weight)
-        # Map layer index to bigram embed index (None means no bigram for that layer)
-        self.bigram_layer_map = [None, 0, 1, 2, 0, 1, 2, 0, 1, 2, None]
 
         # x0_lambdas separated out for different optimizer treatment (no beta smoothing)
         self.x0_lambdas = nn.Parameter(torch.zeros(num_layers))
         self.x0_lambdas.label = 'x0_lambdas'
 
-        pad = (-num_layers * 3 - 3) % dist.get_world_size()  # updated: 3*num_layers instead of 4*
+        pad = (-num_layers * 6 - 3) % dist.get_world_size()
         self.scalars = nn.Parameter(
             torch.cat(
                 [
                     1.1 * torch.ones(num_layers),  # resid lambdas. 1.1 init such that layer i weight is i^(num_layers-i).
                     *[torch.tensor([0.5, 1.0]) for _ in range(num_layers)],  # SA lambdas
-                    0.1 * torch.ones(num_layers), # bigram lambdas
+                    0.1 * torch.ones(num_layers * 3), # bigram lambdas (3 per layer, one per bigram embedding)
                     torch.zeros(1), # smear_lambda
                     0.5*torch.ones(1), # backout_lambda
                     -1.5 * torch.ones(1),  # skip_lambda -> σ(-1.5) ≈ 0.18
@@ -1217,10 +1215,10 @@ class GPT(nn.Module):
         resid_lambdas = self.scalars[: 1 * self.num_layers]
         x0_lambdas = self.x0_lambdas
         sa_lambdas = self.scalars[1 * self.num_layers: 3 * self.num_layers].view(-1, 2)
-        bigram_lambdas = self.scalars[3 * self.num_layers: 4 * self.num_layers]
-        smear_lambda = self.scalars[4 * self.num_layers]
-        backout_lambda = self.scalars[4 * self.num_layers+1]
-        skip_lambda = self.scalars[4 * self.num_layers+2]
+        bigram_lambdas = self.scalars[3 * self.num_layers: 6 * self.num_layers].view(self.num_layers, 3)
+        smear_lambda = self.scalars[6 * self.num_layers]
+        backout_lambda = self.scalars[6 * self.num_layers+1]
+        skip_lambda = self.scalars[6 * self.num_layers+2]
 
         # set block masks and key shift
         short_bm = ws_short * args.block_size
@@ -1274,18 +1272,11 @@ class GPT(nn.Module):
             if i in skip_out:
                 skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
                 x = x + skip_gate_out * skip_connections.pop()
-            # Get bigram contribution for this layer (None for layers 3 and 7)
-            bigram_idx = self.bigram_layer_map[i]
+            bigram_contrib = bigram_lambdas[i, 0] * x0_bigrams[0] + bigram_lambdas[i, 1] * x0_bigrams[1] + bigram_lambdas[i, 2] * x0_bigrams[2]
             if i == 0:
-                if bigram_idx is not None:
-                    x = (resid_lambdas[0] + x0_lambdas[0]) * x + bigram_lambdas[0] * x0_bigrams[bigram_idx]
-                else:
-                    x = (resid_lambdas[0] + x0_lambdas[0]) * x
+                x = x0_lambdas[0] * x + bigram_contrib
             else:
-                if bigram_idx is not None:
-                    x = resid_lambdas[i] * x + x0_lambdas[i] * x0 + bigram_lambdas[i] * x0_bigrams[bigram_idx]
-                else:
-                    x = resid_lambdas[i] * x + x0_lambdas[i] * x0
+                x = resid_lambdas[i] * x + x0_lambdas[i] * x0 + bigram_contrib
             
             # Get weights for this layer from banks
             qkvo_w = attn_weights[self.layer_to_attn_idx[i]] if i in self.layer_to_attn_idx else None
