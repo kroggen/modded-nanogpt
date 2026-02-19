@@ -1228,11 +1228,10 @@ class GPT(nn.Module):
         with torch.no_grad():
             self.embed.weight.copy_(self.lm_head.weight.T)
 
-        # 2 bigram embeddings (A, B) used in pattern: none,A,B,none,A,B,none,A,B,A,B
-        self.bigram_embeds = nn.ModuleList([nn.Embedding(args.bigram_vocab_size, model_dim) for _ in range(2)])
-        for i, be in enumerate(self.bigram_embeds):
-            be.weight.label = f'bigram_embed{i}'
-            nn.init.zeros_(be.weight)
+        self.bigram_embed = nn.Embedding(args.bigram_vocab_size, model_dim)
+        self.bigram_embed.weight.label = 'bigram_embed'
+        nn.init.zeros_(self.bigram_embed.weight)
+        # Map layer index to bigram hash index (None means no bigram for that layer)
         self.bigram_layer_map = [None, 0, 1, None, 0, 1, None, 0, 1, 0, 1]
 
         # x0_lambdas separated out for different optimizer treatment (no beta smoothing)
@@ -1286,7 +1285,7 @@ class GPT(nn.Module):
         # Embedding lookup - embed is synced from lm_head during tied phase by optimizer
         x = self.embed(input_seq)
         
-        x0_bigrams = [be(bigram_input_seqs[i])[None] for i, be in enumerate(self.bigram_embeds)]
+        x0_bigrams = [self.bigram_embed(bigram_input_seqs[i])[None] for i in range(bigram_input_seqs.size(0))]
 
         # Value embeddings - always computed (not precomputed)
         ve = self.value_embeds.view(5, self.vocab_size, -1)[:, input_seq]
@@ -1574,7 +1573,7 @@ class Hyperparameters:
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     # bigram hash embedding
-    bigram_vocab_size: int = 50304 * 5
+    bigram_vocab_size: int = 50304 * 10
 
 args = Hyperparameters()
 
@@ -1698,8 +1697,7 @@ class TrainingManager():
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "x0_lambdas":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.65, 0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
-            "bigram_embed0":  {"optim": "adam",    "comms": "sharded_sparse",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "bigram_embed1":  {"optim": "adam",    "comms": "sharded_sparse",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "bigram_embed":   {"optim": "adam",    "comms": "sharded_sparse",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
             "value_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
@@ -1710,7 +1708,7 @@ class TrainingManager():
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
             "lm_head",
-            "bigram_embed0", "bigram_embed1",  # Medium
+            "bigram_embed",  # Medium
             "value_embed",
             "embed",   # lm_head must complete before embed sync (when tied)
             "attn", "mlp",        # Large, polar express - process last to maximize overlap
@@ -1812,9 +1810,9 @@ class TrainingManager():
         self.model.yarn.reset()
         self.model.yarn_paired_head.reset()
         if _sparse_comms_active():
-            self.row_update_masks = [np.zeros(args.bigram_vocab_size, dtype=np.uint8) for _ in range(2)]
-            self.sparse_counts_states = [None, None]
-            self.send_idxes_buffers = [torch.empty(args.bigram_vocab_size, dtype=torch.int32, pin_memory=True) for _ in range(2)]
+            self.row_update_mask = np.zeros(args.bigram_vocab_size, dtype=np.uint8)
+            self.sparse_counts_state = None
+            self.send_idxes_buffer = torch.empty(args.bigram_vocab_size, dtype=torch.int32, pin_memory=True)
 
 
     def get_state(self):
@@ -1824,32 +1822,29 @@ class TrainingManager():
         if not _sparse_comms_active():
             return
 
-        for i in range(2):
-            self.row_update_masks[i][bigram_indexes[i]] = 1
+        self.row_update_mask[bigram_indexes] = 1
 
         if self._is_adam_step(step):
             with torch.no_grad():
-                for i in range(2):
-                    bigram_idx_np = np.flatnonzero(self.row_update_masks[i]).astype(np.int32)
-                    send_idxes, send_counts, recv_counts, recv_counts_fut = sparse_comms_start(
-                        bigram_idx_np, args.bigram_vocab_size, rank, world_size, self.send_idxes_buffers[i]
-                    )
-                    self.sparse_counts_states[i] = (send_idxes, send_counts, recv_counts, recv_counts_fut)
+                bigram_idx_np = np.flatnonzero(self.row_update_mask).astype(np.int32)
+                send_idxes, send_counts, recv_counts, recv_counts_fut = sparse_comms_start(
+                    bigram_idx_np, args.bigram_vocab_size, rank, world_size, self.send_idxes_buffer
+                )
+                self.sparse_counts_state = (send_idxes, send_counts, recv_counts, recv_counts_fut)
 
     def sparse_index_share(self, step):
         if not _sparse_comms_active() or not self._is_adam_step(step):
             return
 
-        for i, be in enumerate(model.bigram_embeds):
-            send_idxes, send_counts, recv_counts, recv_counts_fut = self.sparse_counts_states[i]
-            self.sparse_counts_states[i] = None
+        send_idxes, send_counts, recv_counts, recv_counts_fut = self.sparse_counts_state
+        self.sparse_counts_state = None
 
-            recv_counts_fut.wait()
-            recv_idxes, sparse_state, idxes_fut = sparse_comms_share_indexes(send_idxes, send_counts, recv_counts)
-            self.optimizer._reduce_futures[be.weight] = [idxes_fut, recv_idxes]
-            self.optimizer._sparse_async_data[be.weight] = sparse_state
+        recv_counts_fut.wait()
+        recv_idxes, sparse_state, idxes_fut = sparse_comms_share_indexes(send_idxes, send_counts, recv_counts)
+        self.optimizer._reduce_futures[model.bigram_embed.weight] = [idxes_fut, recv_idxes]
+        self.optimizer._sparse_async_data[model.bigram_embed.weight] = sparse_state
 
-            self.row_update_masks[i].fill(0)
+        self.row_update_mask.fill(0)
 
 
         
