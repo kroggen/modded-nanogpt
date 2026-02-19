@@ -1448,29 +1448,22 @@ class Shard:
             return result['shard']
         return get
 
-def get_bigram_hashes(x, num_hashes=2):
+def get_bigram_hashes(x):
     """
-    Computes multiple bigram hashes for each position using [prev_token, curr_token].
+    Computes 2 bigram hashes for each position using [prev_token, curr_token].
     Each hash uses different constants so collisions differ across embeddings.
     Position 0 is mapped to the reserved index (vocab_size - 1).
     BOS_tokens within the batch will hash based on last token of prior doc. Masking this ran slower and showed no improvement.
-    Returns a stacked tensor of shape (num_hashes, seq_len).
+    Returns a pinned tensor of shape (2, seq_len).
     """
-    hash_constants = [
-        (36313, 27191),
-        (52711, 41983),
-        (65449, 73259),
-    ]
+    r1 = torch.tensor([[36313], [52711]], dtype=torch.int32)
+    r2 = torch.tensor([[27191], [41983]], dtype=torch.int32)
     mod = args.bigram_vocab_size - 1
     x = x.to(torch.int32)
-    hashes = []
-    for i in range(num_hashes):
-        r1, r2 = hash_constants[i]
-        h = x.clone()
-        h[0] = mod
-        h[1:] = torch.bitwise_xor(r1 * x[1:], r2 * x[:-1]) % mod
-        hashes.append(h)
-    return torch.stack(hashes)
+    out = torch.empty(2, x.size(0), dtype=torch.int32, pin_memory=True)
+    out[:, 0] = mod
+    out[:, 1:] = torch.bitwise_xor(r1 * x[1:], r2 * x[:-1]) % mod
+    return out
 
 def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True):
     # align_to_bos: each sequence begins with Beginning of Sequence token, sequences truncated to max_seq_len
