@@ -1228,9 +1228,12 @@ class GPT(nn.Module):
         with torch.no_grad():
             self.embed.weight.copy_(self.lm_head.weight.T)
 
-        self.bigram_embed = nn.Embedding(args.bigram_vocab_size, model_dim)
-        self.bigram_embed.weight.label = 'bigram_embed'
-        nn.init.zeros_(self.bigram_embed.weight)
+        # 2 bigram embeddings (A, B) used in pattern: none,A,B,none,A,B,none,A,B,A,B
+        self.bigram_embeds = nn.ModuleList([nn.Embedding(args.bigram_vocab_size, model_dim) for _ in range(2)])
+        for i, be in enumerate(self.bigram_embeds):
+            be.weight.label = f'bigram_embed{i}'
+            nn.init.zeros_(be.weight)
+        self.bigram_layer_map = [None, 0, 1, None, 0, 1, None, 0, 1, 0, 1]
 
         # x0_lambdas separated out for different optimizer treatment (no beta smoothing)
         self.x0_lambdas = nn.Parameter(torch.zeros(num_layers))
@@ -1252,7 +1255,7 @@ class GPT(nn.Module):
         )
         self.scalars.label = 'scalars'
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
+    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seqs: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
 
         # unpack schedule_cfg
@@ -1283,7 +1286,7 @@ class GPT(nn.Module):
         # Embedding lookup - embed is synced from lm_head during tied phase by optimizer
         x = self.embed(input_seq)
         
-        x0_bigram = self.bigram_embed(bigram_input_seq)[None]
+        x0_bigrams = [be(bigram_input_seqs[i])[None] for i, be in enumerate(self.bigram_embeds)]
 
         # Value embeddings - always computed (not precomputed)
         ve = self.value_embeds.view(5, self.vocab_size, -1)[:, input_seq]
@@ -1325,10 +1328,17 @@ class GPT(nn.Module):
             if i in skip_out:
                 skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
                 x = x + skip_gate_out * skip_connections.pop()
+            bigram_idx = self.bigram_layer_map[i]
             if i == 0:
-                x = (resid_lambdas[0] + x0_lambdas[0]) * x + bigram_lambdas[0] * x0_bigram
+                if bigram_idx is not None:
+                    x = (resid_lambdas[0] + x0_lambdas[0]) * x + bigram_lambdas[0] * x0_bigrams[bigram_idx]
+                else:
+                    x = (resid_lambdas[0] + x0_lambdas[0]) * x
             else:
-                x = resid_lambdas[i] * x + x0_lambdas[i] * x0 + bigram_lambdas[i] * x0_bigram
+                if bigram_idx is not None:
+                    x = resid_lambdas[i] * x + x0_lambdas[i] * x0 + bigram_lambdas[i] * x0_bigrams[bigram_idx]
+                else:
+                    x = resid_lambdas[i] * x + x0_lambdas[i] * x0
 
             # Get weights for this layer from banks
             qkvo_w = attn_weights[self.layer_to_attn_idx[i]] if i in self.layer_to_attn_idx else None
@@ -1439,22 +1449,29 @@ class Shard:
             return result['shard']
         return get
 
-def get_bigram_hash(x):
+def get_bigram_hashes(x, num_hashes=2):
     """
-    Computes bigram hash for each position using [prev_token, curr_token].
-    Multiply by arbitary large ints to get even spread over int32 range.
+    Computes multiple bigram hashes for each position using [prev_token, curr_token].
+    Each hash uses different constants so collisions differ across embeddings.
     Position 0 is mapped to the reserved index (vocab_size - 1).
     BOS_tokens within the batch will hash based on last token of prior doc. Masking this ran slower and showed no improvement.
+    Returns a stacked tensor of shape (num_hashes, seq_len).
     """
-    rand_int_1 = 36313
-    rand_int_2 = 27191
-    mod = args.bigram_vocab_size-1
+    hash_constants = [
+        (36313, 27191),
+        (52711, 41983),
+        (65449, 73259),
+    ]
+    mod = args.bigram_vocab_size - 1
     x = x.to(torch.int32)
-    out = torch.empty_like(x, pin_memory=True)
-    out.copy_(x)
-    out[0] = mod
-    out[1:] = torch.bitwise_xor(rand_int_1 * out[1:], rand_int_2 * out[:-1]) % mod
-    return out
+    hashes = []
+    for i in range(num_hashes):
+        r1, r2 = hash_constants[i]
+        h = x.clone()
+        h[0] = mod
+        h[1:] = torch.bitwise_xor(r1 * x[1:], r2 * x[:-1]) % mod
+        hashes.append(h)
+    return torch.stack(hashes)
 
 def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True):
     # align_to_bos: each sequence begins with Beginning of Sequence token, sequences truncated to max_seq_len
@@ -1520,7 +1537,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
         _inputs = _inputs.to(dtype=torch.int32)
         _targets = _targets.to(dtype=torch.int64)
         _cum_lengths = _cum_lengths.to(dtype=torch.int32)
-        _bigram_inputs = get_bigram_hash(_inputs)
+        _bigram_inputs = get_bigram_hashes(_inputs)
 
         new_params = yield (
             _inputs.to(device="cuda", non_blocking=True),
@@ -1681,7 +1698,8 @@ class TrainingManager():
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "x0_lambdas":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.65, 0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
-            "bigram_embed":   {"optim": "adam",    "comms": "sharded_sparse",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "bigram_embed0":  {"optim": "adam",    "comms": "sharded_sparse",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "bigram_embed1":  {"optim": "adam",    "comms": "sharded_sparse",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
             "value_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
@@ -1692,7 +1710,7 @@ class TrainingManager():
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
             "lm_head",
-            "bigram_embed",  # Medium
+            "bigram_embed0", "bigram_embed1",  # Medium
             "value_embed",
             "embed",   # lm_head must complete before embed sync (when tied)
             "attn", "mlp",        # Large, polar express - process last to maximize overlap
@@ -1794,10 +1812,9 @@ class TrainingManager():
         self.model.yarn.reset()
         self.model.yarn_paired_head.reset()
         if _sparse_comms_active():
-            self.row_update_mask = np.zeros(args.bigram_vocab_size, dtype=np.uint8)
-            self.sparse_counts_state = None
-            # buffer we use for fast GPU uploads of send indexes
-            self.send_idxes_buffer = torch.empty(args.bigram_vocab_size, dtype=torch.int32, pin_memory=True)
+            self.row_update_masks = [np.zeros(args.bigram_vocab_size, dtype=np.uint8) for _ in range(2)]
+            self.sparse_counts_states = [None, None]
+            self.send_idxes_buffers = [torch.empty(args.bigram_vocab_size, dtype=torch.int32, pin_memory=True) for _ in range(2)]
 
 
     def get_state(self):
@@ -1807,29 +1824,32 @@ class TrainingManager():
         if not _sparse_comms_active():
             return
 
-        self.row_update_mask[bigram_indexes] = 1
+        for i in range(2):
+            self.row_update_masks[i][bigram_indexes[i]] = 1
 
         if self._is_adam_step(step):
             with torch.no_grad():
-                bigram_idx_np = np.flatnonzero(self.row_update_mask).astype(np.int32)
-                send_idxes, send_counts, recv_counts, recv_counts_fut = sparse_comms_start(
-                    bigram_idx_np, args.bigram_vocab_size, rank, world_size, self.send_idxes_buffer
-                )
-                self.sparse_counts_state = (send_idxes, send_counts, recv_counts, recv_counts_fut)
+                for i in range(2):
+                    bigram_idx_np = np.flatnonzero(self.row_update_masks[i]).astype(np.int32)
+                    send_idxes, send_counts, recv_counts, recv_counts_fut = sparse_comms_start(
+                        bigram_idx_np, args.bigram_vocab_size, rank, world_size, self.send_idxes_buffers[i]
+                    )
+                    self.sparse_counts_states[i] = (send_idxes, send_counts, recv_counts, recv_counts_fut)
 
     def sparse_index_share(self, step):
         if not _sparse_comms_active() or not self._is_adam_step(step):
             return
 
-        send_idxes, send_counts, recv_counts, recv_counts_fut = self.sparse_counts_state
-        self.sparse_counts_state = None
+        for i, be in enumerate(model.bigram_embeds):
+            send_idxes, send_counts, recv_counts, recv_counts_fut = self.sparse_counts_states[i]
+            self.sparse_counts_states[i] = None
 
-        recv_counts_fut.wait()
-        recv_idxes, sparse_state, idxes_fut = sparse_comms_share_indexes(send_idxes, send_counts, recv_counts)
-        self.optimizer._reduce_futures[model.bigram_embed.weight] = [idxes_fut, recv_idxes]
-        self.optimizer._sparse_async_data[model.bigram_embed.weight] = sparse_state
+            recv_counts_fut.wait()
+            recv_idxes, sparse_state, idxes_fut = sparse_comms_share_indexes(send_idxes, send_counts, recv_counts)
+            self.optimizer._reduce_futures[be.weight] = [idxes_fut, recv_idxes]
+            self.optimizer._sparse_async_data[be.weight] = sparse_state
 
-        self.row_update_mask.fill(0)
+            self.row_update_masks[i].fill(0)
 
 
         
